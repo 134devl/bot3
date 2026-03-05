@@ -33,20 +33,25 @@ from aiogram.types import (
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(id_str) for id_str in os.getenv("ADMIN_IDS", "").split(",") if id_str]
-TARGET_GROUP_ID = int(os.getenv("TARGET_GROUP_ID"))
+admin_ids_str = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
+
+TARGET_GROUP_ID = int(os.getenv("TARGET_GROUP_ID", 0))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
 WELCOME_BG = os.getenv("WELCOME_BG", "welcome_bg.jpg")
 NIGHT_START = int(os.getenv("NIGHT_START", 0))
 MORNING_START = int(os.getenv("MORNING_START", 8))
 
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")
-WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
-WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", 8080))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")     
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")   
+WEB_SERVER_HOST = "0.0.0.0" 
+
+# (!) ВАЖНОЕ ИСПРАВЛЕНИЕ: Берем порт от Render, если он есть, иначе 8080
+WEB_SERVER_PORT = int(os.getenv("PORT", os.getenv("WEB_SERVER_PORT", 8080)))
 
 TEXT_PC = (
     "💻 <b>Касательно версии для ПК:</b>\n\n"
@@ -61,12 +66,14 @@ TEXT_IOS = (
     "но точных сроков выхода приложения на данный момент нет."
 )
 
+
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 tz = pytz.timezone(TIMEZONE)
 scheduler = AsyncIOScheduler(timezone=tz)
+
 
 class BugState(StatesGroup):
     waiting_for_version = State()
@@ -84,6 +91,7 @@ class TrackState(StatesGroup):
     waiting_for_name = State()
     waiting_for_issue = State()
     waiting_for_media = State()
+
 
 async def get_avatar_bytes(user_id: int) -> bytes | None:
     try:
@@ -110,7 +118,7 @@ async def build_welcome_image(avatar_bytes: bytes | None) -> io.BytesIO | None:
         out.seek(0)
         return out
     except Exception as e:
-        logging.error(f"Error building image: {e}")
+        logging.error(f"Image build error: {e}")
         return None
 
 async def send_report_to_admins(report_text: str, message: Message):
@@ -153,17 +161,16 @@ async def check_mode_on_startup():
             can_send_messages=True, can_send_audios=False, can_send_documents=False,
             can_send_photos=False, can_send_videos=False
         )
-        try:
-            await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
-        except Exception: pass
+        try: await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
+        except: pass
     else:
         permissions = ChatPermissions(
             can_send_messages=True, can_send_audios=True, can_send_documents=True,
             can_send_photos=True, can_send_videos=True
         )
-        try:
-            await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
-        except Exception: pass
+        try: await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
+        except: pass
+
 
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start_private(message: Message):
@@ -232,7 +239,6 @@ async def bug_actual(message: Message, state: FSMContext):
 async def bug_finish(message: Message, state: FSMContext):
     data = await state.get_data()
     user = message.from_user
-    
     text = (
         f"🚨 <b>БАГ-РЕПОРТ</b>\n"
         f"👤 От: {user.mention_html()} (ID: <code>{user.id}</code>)\n"
@@ -241,7 +247,6 @@ async def bug_finish(message: Message, state: FSMContext):
         f"✅ <b>Ожидание:</b>\n{data['expected']}\n\n"
         f"❌ <b>Факт:</b>\n{data['actual']}"
     )
-    
     await send_report_to_admins(text, message)
     await message.answer("✅ Баг-репорт отправлен!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
@@ -263,13 +268,11 @@ async def feature_desc(message: Message, state: FSMContext):
 async def feature_finish(message: Message, state: FSMContext):
     data = await state.get_data()
     user = message.from_user
-    
     text = (
         f"💡 <b>НОВАЯ ИДЕЯ</b>\n"
         f"👤 От: {user.mention_html()} (ID: <code>{user.id}</code>)\n\n"
         f"💬 <b>Суть предложения:</b>\n{data['desc']}"
     )
-    
     await send_report_to_admins(text, message)
     await message.answer("✅ Ваше предложение отправлено!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
@@ -297,14 +300,12 @@ async def track_issue(message: Message, state: FSMContext):
 async def track_finish(message: Message, state: FSMContext):
     data = await state.get_data()
     user = message.from_user
-    
     text = (
         f"🎵 <b>ПРОБЛЕМА С ТРЕКОМ</b>\n"
         f"👤 От: {user.mention_html()} (ID: <code>{user.id}</code>)\n\n"
         f"🎼 <b>Трек:</b> {data['track']}\n"
         f"⚠️ <b>Проблема:</b> {data['issue']}"
     )
-    
     await send_report_to_admins(text, message)
     await message.answer("✅ Жалоба на контент отправлена!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
@@ -335,19 +336,20 @@ async def group_message_handler(message: Message):
     if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
         user_name = str(message.from_user.first_name).replace("<", "&lt;").replace(">", "&gt;")
         await message.reply(f"{user_name}, я всего лишь бот. Пожалуйста, дождитесь администратора.")
-
+        
 async def on_startup(bot: Bot):
     await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
     scheduler.add_job(set_night_mode, 'cron', hour=NIGHT_START, minute=0)
     scheduler.add_job(set_day_mode, 'cron', hour=MORNING_START, minute=0)
     scheduler.start()
     await check_mode_on_startup()
-    logging.info(f"Webhook set to {WEBHOOK_URL}{WEBHOOK_PATH}")
+    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}{WEBHOOK_PATH}")
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
     scheduler.shutdown()
-    logging.info("Webhook deleted")
+    await bot.session.close()
+    logging.info("🛑 Бот остановлен, сессия закрыта.")
 
 async def health_check(request):
     return web.Response(text="Bot is running OK", status=200)
@@ -357,7 +359,9 @@ def main():
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
+
     app.router.add_get('/', health_check)
+
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
