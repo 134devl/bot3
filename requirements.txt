@@ -1,0 +1,6 @@
+aiogram
+aiohttp 
+python-dotenv 
+apscheduler 
+pytz 
+pillow
