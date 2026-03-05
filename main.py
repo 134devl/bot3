@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import traceback
 from datetime import datetime
 
 import pytz
@@ -28,16 +29,32 @@ from aiogram.types import (
     CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
+    ErrorEvent
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 load_dotenv()
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.critical("BOT_TOKEN не найден! Бот не может быть запущен.")
+    sys.exit(1)
+
 admin_ids_str = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
+try:
+    ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
+except Exception:
+    ADMIN_IDS = []
+    logger.warning("ADMIN_IDS не настроены или имеют неверный формат.")
 
 TARGET_GROUP_ID = int(os.getenv("TARGET_GROUP_ID", 0))
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
@@ -46,7 +63,7 @@ NIGHT_START = int(os.getenv("NIGHT_START", 0))
 MORNING_START = int(os.getenv("MORNING_START", 8))
 
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")     
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")   
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")   
 WEB_SERVER_HOST = "0.0.0.0" 
 WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
@@ -63,7 +80,6 @@ TEXT_IOS = (
     "но точных сроков выхода приложения на данный момент нет."
 )
 
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -87,6 +103,14 @@ class TrackState(StatesGroup):
     waiting_for_issue = State()
     waiting_for_media = State()
 
+
+async def safe_send_message(chat_id: int, text: str, **kwargs):
+    """Безопасная отправка сообщения, чтобы не крашить при блокировке бота пользователем"""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения {chat_id}: {e}")
+
 async def get_avatar_bytes(user_id: int) -> bytes | None:
     try:
         photos = await bot.get_user_profile_photos(user_id, limit=1)
@@ -95,104 +119,111 @@ async def get_avatar_bytes(user_id: int) -> bytes | None:
         buf = io.BytesIO()
         await bot.download_file(file.file_path, buf)
         return buf.getvalue()
-    except Exception: return None
+    except Exception as e:
+        logger.warning(f"Не удалось получить аватар {user_id}: {e}")
+        return None
 
 def _process_image_sync(avatar_bytes: bytes | None) -> io.BytesIO | None:
-    if not os.path.exists(WELCOME_BG): return None
+    """Синхронная обработка Pillow. Вызывается в треде."""
+    if not os.path.exists(WELCOME_BG):
+        logger.warning(f"Фон {WELCOME_BG} не найден!")
+        return None
     try:
         bg = Image.open(WELCOME_BG).convert("RGBA")
         if avatar_bytes:
-            av = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA").resize((500, 500))
+            av = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+            av = av.resize((500, 500)) # Resize
+            
             mask = Image.new("L", (500, 500), 0)
             ImageDraw.Draw(mask).ellipse((0, 0, 499, 499), fill=255)
+            
             pos = (1250, 397)
             bg.paste(av, pos, mask)
+        
         out = io.BytesIO()
-        bg.convert("RGB").save(out, format="JPEG", quality=92)
+        bg.convert("RGB").save(out, format="JPEG", quality=85, optimize=True)
         out.seek(0)
         return out
     except Exception as e:
-        logging.error(f"Image build error: {e}")
+        logger.error(f"CRITICAL: Ошибка при обработке изображения: {e}", exc_info=True)
         return None
 
 async def build_welcome_image(avatar_bytes: bytes | None) -> io.BytesIO | None:
+    """Обертка для запуска тяжелой задачи в потоке"""
     return await asyncio.to_thread(_process_image_sync, avatar_bytes)
 
-async def send_report_to_admins(report_text: str, message: Message):
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(chat_id=admin_id, text=report_text)
-            if message.content_type in ['photo', 'video', 'document', 'audio']:
-                 await message.send_copy(chat_id=admin_id)
-        except Exception as e:
-            logging.error(f"Failed to send to admin {admin_id}: {e}")
 
-async def set_night_mode():
+async def task_send_welcome(chat_id: int, user_first_name: str, user_id: int, is_private: bool):
+    """
+    Фоновая задача отправки приветствия.
+    Она выполняется параллельно ответу вебхука, поэтому не задерживает сервер.
+    """
     try:
-        permissions = ChatPermissions(
-            can_send_messages=True, can_send_audios=False, can_send_documents=False,
-            can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
-            can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False,
-            can_add_web_page_previews=False
-        )
-        await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
-        await bot.send_message(TARGET_GROUP_ID, "🌙 <b>Ночной режим включен.</b>\nМедиафайлы отключены до утра.")
-    except Exception as e: logging.error(f"Night mode error: {e}")
+        avatar = await get_avatar_bytes(user_id)
+        img_io = await build_welcome_image(avatar)
+        
+        if is_private:
+            caption = (
+                f"👋 <b>Привет, {user_first_name}!</b>\n\n"
+                f"Добро пожаловать в бота поддержки LANE.\n"
+                f"Выберите тип обращения:"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🐛 Сообщить о баге", callback_data="type_bug")],
+                [InlineKeyboardButton(text="💡 Предложить идею", callback_data="type_feature")],
+                [InlineKeyboardButton(text="🎵 Проблема с треком", callback_data="type_track")]
+            ])
+            
+            if img_io:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=BufferedInputFile(img_io.read(), filename="welcome.jpg"),
+                    caption=caption,
+                    reply_markup=kb
+                )
+            else:
+                await bot.send_message(chat_id=chat_id, text=caption, reply_markup=kb)
+        
+        else:
+            caption = f"👋 <b>Привет, {user_first_name}!</b>\n\nДобро пожаловать в комьюнити LANE. Мы строим будущее музыки."
+            if img_io:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=BufferedInputFile(img_io.read(), filename="welcome.jpg"),
+                    caption=caption
+                )
+            else:
+                await bot.send_message(chat_id=chat_id, text=caption)
+                
+    except Exception as e:
+        logger.error(f"Ошибка в фоновой задаче task_send_welcome: {e}", exc_info=True)
 
-async def set_day_mode():
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=True, can_send_audios=True, can_send_documents=True,
-            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-            can_add_web_page_previews=True
-        )
-        await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
-        await bot.send_message(TARGET_GROUP_ID, "☀️ <b>Доброе утро!</b>\nЧат открыт.")
-    except Exception as e: logging.error(f"Day mode error: {e}")
 
-async def check_mode_on_startup():
-    now_hour = datetime.now(tz).hour
-    if NIGHT_START <= now_hour < MORNING_START:
-        permissions = ChatPermissions(
-            can_send_messages=True, can_send_audios=False, can_send_documents=False,
-            can_send_photos=False, can_send_videos=False
-        )
-        try: await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
-        except: pass
-    else:
-        permissions = ChatPermissions(
-            can_send_messages=True, can_send_audios=True, can_send_documents=True,
-            can_send_photos=True, can_send_videos=True
-        )
-        try: await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
-        except: pass
+@dp.error()
+async def global_error_handler(event: ErrorEvent):
+    """
+    Перехватывает ЛЮБУЮ необработанную ошибку в хендлерах.
+    Предотвращает падение бота.
+    """
+    logger.critical("🚨 Unhandled exception detected:", exc_info=event.exception)
+    
+    error_msg = f"⚠️ <b>В боте произошла ошибка:</b>\n<code>{str(event.exception)[:100]}</code>"
+    for admin in ADMIN_IDS:
+        await safe_send_message(admin, error_msg)
+
 
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start_private(message: Message):
-    user = message.from_user
-    avatar = await get_avatar_bytes(user.id)
-    img_io = await build_welcome_image(avatar)
-    
-    caption = (
-        f"👋 <b>Привет, {user.first_name}!</b>\n\n"
-        f"Добро пожаловать в бота поддержки LANE.\n"
-        f"Выберите тип обращения:"
+    asyncio.create_task(
+        task_send_welcome(message.chat.id, message.from_user.first_name, message.from_user.id, True)
     )
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🐛 Сообщить о баге", callback_data="type_bug")],
-        [InlineKeyboardButton(text="💡 Предложить идею", callback_data="type_feature")],
-        [InlineKeyboardButton(text="🎵 Проблема с треком", callback_data="type_track")]
-    ])
-
-    if img_io:
-        await message.answer_photo(
-            photo=BufferedInputFile(img_io.read(), filename="welcome.jpg"),
-            caption=caption, reply_markup=kb
-        )
-    else:
-        await message.answer(text=caption, reply_markup=kb)
+@dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
+async def on_user_joined(event: ChatMemberUpdated):
+    if event.chat.id != TARGET_GROUP_ID: return
+    asyncio.create_task(
+        task_send_welcome(event.chat.id, event.new_chat_member.user.first_name, event.new_chat_member.user.id, False)
+    )
 
 @dp.callback_query(F.data == "type_bug")
 async def cb_bug_start(call: CallbackQuery, state: FSMContext):
@@ -231,22 +262,37 @@ async def bug_actual(message: Message, state: FSMContext):
     await message.answer("6️⃣ Прикрепите скриншот/видео (или нажмите 'Пропустить'):", reply_markup=kb)
     await state.set_state(BugState.waiting_for_media)
 
+async def send_report_to_admins(report_text: str, message: Message):
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(chat_id=admin_id, text=report_text)
+            if message.content_type in ['photo', 'video', 'document', 'audio']:
+                 await message.send_copy(chat_id=admin_id)
+        except Exception as e:
+            logger.error(f"Failed to send to admin {admin_id}: {e}")
+
 @dp.message(BugState.waiting_for_media)
 async def bug_finish(message: Message, state: FSMContext):
-    data = await state.get_data()
-    user = message.from_user
-    text = (
-        f"🚨 <b>БАГ-РЕПОРТ</b>\n"
-        f"👤 От: {user.mention_html()} (ID: <code>{user.id}</code>)\n"
-        f"📱 Device: {data['device']} | Ver: {data['version']}\n\n"
-        f"👣 <b>Шаги:</b>\n{data['steps']}\n\n"
-        f"✅ <b>Ожидание:</b>\n{data['expected']}\n\n"
-        f"❌ <b>Факт:</b>\n{data['actual']}"
-    )
-    await send_report_to_admins(text, message)
-    await message.answer("✅ Баг-репорт отправлен!", reply_markup=ReplyKeyboardRemove())
-    await state.clear()
+    try:
+        data = await state.get_data()
+        user = message.from_user
+        text = (
+            f"🚨 <b>БАГ-РЕПОРТ</b>\n"
+            f"👤 От: {user.mention_html()} (ID: <code>{user.id}</code>)\n"
+            f"📱 Device: {data.get('device', 'N/A')} | Ver: {data.get('version', 'N/A')}\n\n"
+            f"👣 <b>Шаги:</b>\n{data.get('steps', 'N/A')}\n\n"
+            f"✅ <b>Ожидание:</b>\n{data.get('expected', 'N/A')}\n\n"
+            f"❌ <b>Факт:</b>\n{data.get('actual', 'N/A')}"
+        )
+        await send_report_to_admins(text, message)
+        await message.answer("✅ Баг-репорт отправлен!", reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+    except Exception as e:
+        logger.error(f"Ошибка при отправке бага: {e}")
+        await message.answer("Произошла ошибка при отправке, но мы это записали.")
+        await state.clear()
 
+# --- Фичи ---
 @dp.callback_query(F.data == "type_feature")
 async def cb_feature_start(call: CallbackQuery, state: FSMContext):
     await call.message.answer("💡 <b>Предложение идеи</b>\nОпишите ваше предложение максимально подробно:")
@@ -267,7 +313,7 @@ async def feature_finish(message: Message, state: FSMContext):
     text = (
         f"💡 <b>НОВАЯ ИДЕЯ</b>\n"
         f"👤 От: {user.mention_html()} (ID: <code>{user.id}</code>)\n\n"
-        f"💬 <b>Суть предложения:</b>\n{data['desc']}"
+        f"💬 <b>Суть предложения:</b>\n{data.get('desc', 'N/A')}"
     )
     await send_report_to_admins(text, message)
     await message.answer("✅ Ваше предложение отправлено!", reply_markup=ReplyKeyboardRemove())
@@ -299,25 +345,13 @@ async def track_finish(message: Message, state: FSMContext):
     text = (
         f"🎵 <b>ПРОБЛЕМА С ТРЕКОМ</b>\n"
         f"👤 От: {user.mention_html()} (ID: <code>{user.id}</code>)\n\n"
-        f"🎼 <b>Трек:</b> {data['track']}\n"
-        f"⚠️ <b>Проблема:</b> {data['issue']}"
+        f"🎼 <b>Трек:</b> {data.get('track', 'N/A')}\n"
+        f"⚠️ <b>Проблема:</b> {data.get('issue', 'N/A')}"
     )
     await send_report_to_admins(text, message)
     await message.answer("✅ Жалоба на контент отправлена!", reply_markup=ReplyKeyboardRemove())
     await state.clear()
 
-@dp.chat_member(ChatMemberUpdatedFilter(member_status_changed=MEMBER))
-async def on_user_joined(event: ChatMemberUpdated):
-    if event.chat.id != TARGET_GROUP_ID: return
-    user = event.new_chat_member.user
-    avatar = await get_avatar_bytes(user.id)
-    img_io = await build_welcome_image(avatar)
-    caption = f"👋 <b>Привет, {user.first_name}!</b>\n\nДобро пожаловать в комьюнити LANE. Мы строим будущее музыки."
-    
-    if img_io:
-        await bot.send_photo(chat_id=event.chat.id, photo=BufferedInputFile(img_io.read(), filename="welcome.jpg"), caption=caption)
-    else:
-        await bot.send_message(chat_id=event.chat.id, text=caption)
 
 PC_REGEX = re.compile(r"\b(пк|pc|комп|windows|десктоп)\b", re.IGNORECASE)
 IOS_REGEX = re.compile(r"\b(ios|айос|иос|iphone|айфон)\b", re.IGNORECASE)
@@ -326,26 +360,81 @@ IOS_REGEX = re.compile(r"\b(ios|айос|иос|iphone|айфон)\b", re.IGNORE
 async def group_message_handler(message: Message):
     if message.text.startswith("/"): return
     text_lower = message.text.lower()
-    if PC_REGEX.search(text_lower): await message.reply(TEXT_PC)
-    elif IOS_REGEX.search(text_lower): await message.reply(TEXT_IOS)
+    
+    if PC_REGEX.search(text_lower): 
+        await message.reply(TEXT_PC)
+    elif IOS_REGEX.search(text_lower): 
+        await message.reply(TEXT_IOS)
     
     if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
         user_name = str(message.from_user.first_name).replace("<", "&lt;").replace(">", "&gt;")
         await message.reply(f"{user_name}, я всего лишь бот. Пожалуйста, дождитесь администратора.")
-        
+
+
+async def set_night_mode():
+    try:
+        permissions = ChatPermissions(
+            can_send_messages=True, can_send_audios=False, can_send_documents=False,
+            can_send_photos=False, can_send_videos=False, can_send_video_notes=False,
+            can_send_voice_notes=False, can_send_polls=False, can_send_other_messages=False,
+            can_add_web_page_previews=False
+        )
+        await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
+        await bot.send_message(TARGET_GROUP_ID, "🌙 <b>Ночной режим включен.</b>\nМедиафайлы отключены до утра.")
+    except Exception as e: logger.error(f"Night mode error: {e}")
+
+async def set_day_mode():
+    try:
+        permissions = ChatPermissions(
+            can_send_messages=True, can_send_audios=True, can_send_documents=True,
+            can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
+            can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
+            can_add_web_page_previews=True
+        )
+        await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
+        await bot.send_message(TARGET_GROUP_ID, "☀️ <b>Доброе утро!</b>\nЧат открыт.")
+    except Exception as e: logger.error(f"Day mode error: {e}")
+
+async def check_mode_on_startup():
+    if TARGET_GROUP_ID == 0: return
+    try:
+        now_hour = datetime.now(tz).hour
+        if NIGHT_START <= now_hour < MORNING_START:
+            permissions = ChatPermissions(
+                can_send_messages=True, can_send_audios=False, can_send_documents=False,
+                can_send_photos=False, can_send_videos=False
+            )
+            await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
+        else:
+            permissions = ChatPermissions(
+                can_send_messages=True, can_send_audios=True, can_send_documents=True,
+                can_send_photos=True, can_send_videos=True
+            )
+            await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
+    except Exception as e:
+        logger.warning(f"Ошибка проверки режима при старте: {e}")
+
 async def on_startup(bot: Bot):
-    await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
-    scheduler.add_job(set_night_mode, 'cron', hour=NIGHT_START, minute=0)
-    scheduler.add_job(set_day_mode, 'cron', hour=MORNING_START, minute=0)
-    scheduler.start()
+    try:
+        await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
+        logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}{WEBHOOK_PATH}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки вебхука: {e}")
+        
+    try:
+        scheduler.add_job(set_night_mode, 'cron', hour=NIGHT_START, minute=0)
+        scheduler.add_job(set_day_mode, 'cron', hour=MORNING_START, minute=0)
+        scheduler.start()
+        logger.info("🕒 Планировщик запущен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска планировщика: {e}")
+        
     await check_mode_on_startup()
-    logging.info(f"✅ Webhook установлен: {WEBHOOK_URL}{WEBHOOK_PATH}")
 
 async def on_shutdown(bot: Bot):
-    await bot.delete_webhook()
     if scheduler.running:
         scheduler.shutdown()
-    logging.info("🛑 Бот остановлен.")
+    logger.info("🛑 Бот остановлен.")
 
 async def health_check(request):
     return web.Response(text="Bot is running OK", status=200)
@@ -355,18 +444,17 @@ def main():
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
-
     app.router.add_get('/', health_check)
 
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
+    webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
 
     setup_application(app, dp, bot=bot)
     
-    web.run_app(app, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+    try:
+        web.run_app(app, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+    except Exception as e:
+        logger.critical(f"FATAL: Web server crashed: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()
