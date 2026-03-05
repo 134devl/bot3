@@ -416,6 +416,9 @@ async def check_mode_on_startup():
 
 async def on_startup(bot: Bot):
     try:
+        # УДАЛЯЕМ WEBHOOK С ФЛАГОМ drop_pending_updates=True, ЧТОБЫ СБРОСИТЬ ОЧЕРЕДЬ
+        await bot.delete_webhook(drop_pending_updates=True)
+        
         await bot.set_webhook(f"{WEBHOOK_URL}{WEBHOOK_PATH}")
         logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}{WEBHOOK_PATH}")
     except Exception as e:
