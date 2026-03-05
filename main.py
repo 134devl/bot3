@@ -149,7 +149,6 @@ async def set_day_mode():
 async def check_mode_on_startup():
     now_hour = datetime.now(tz).hour
     if NIGHT_START <= now_hour < MORNING_START:
-        # Мы не отправляем сообщение при старте бота, просто ставим права, чтобы не спамить при рестартах
         permissions = ChatPermissions(
             can_send_messages=True, can_send_audios=False, can_send_documents=False,
             can_send_photos=False, can_send_videos=False
@@ -349,6 +348,9 @@ async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
     scheduler.shutdown()
     logging.info("Webhook deleted")
+
+async def health_check(request):
+    return web.Response(text="Bot is running OK", status=200)
 
 def main():
     dp.startup.register(on_startup)
