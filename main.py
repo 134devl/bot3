@@ -33,7 +33,6 @@ from aiogram.types import (
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -49,9 +48,7 @@ MORNING_START = int(os.getenv("MORNING_START", 8))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")     
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH")   
 WEB_SERVER_HOST = "0.0.0.0" 
-
-# (!) ВАЖНОЕ ИСПРАВЛЕНИЕ: Берем порт от Render, если он есть, иначе 8080
-WEB_SERVER_PORT = int(os.getenv("PORT", os.getenv("WEB_SERVER_PORT", 8080)))
+WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
 TEXT_PC = (
     "💻 <b>Касательно версии для ПК:</b>\n\n"
@@ -66,14 +63,12 @@ TEXT_IOS = (
     "но точных сроков выхода приложения на данный момент нет."
 )
 
-
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 tz = pytz.timezone(TIMEZONE)
 scheduler = AsyncIOScheduler(timezone=tz)
-
 
 class BugState(StatesGroup):
     waiting_for_version = State()
@@ -92,7 +87,6 @@ class TrackState(StatesGroup):
     waiting_for_issue = State()
     waiting_for_media = State()
 
-
 async def get_avatar_bytes(user_id: int) -> bytes | None:
     try:
         photos = await bot.get_user_profile_photos(user_id, limit=1)
@@ -103,7 +97,7 @@ async def get_avatar_bytes(user_id: int) -> bytes | None:
         return buf.getvalue()
     except Exception: return None
 
-async def build_welcome_image(avatar_bytes: bytes | None) -> io.BytesIO | None:
+def _process_image_sync(avatar_bytes: bytes | None) -> io.BytesIO | None:
     if not os.path.exists(WELCOME_BG): return None
     try:
         bg = Image.open(WELCOME_BG).convert("RGBA")
@@ -120,6 +114,9 @@ async def build_welcome_image(avatar_bytes: bytes | None) -> io.BytesIO | None:
     except Exception as e:
         logging.error(f"Image build error: {e}")
         return None
+
+async def build_welcome_image(avatar_bytes: bytes | None) -> io.BytesIO | None:
+    return await asyncio.to_thread(_process_image_sync, avatar_bytes)
 
 async def send_report_to_admins(report_text: str, message: Message):
     for admin_id in ADMIN_IDS:
@@ -170,7 +167,6 @@ async def check_mode_on_startup():
         )
         try: await bot.set_chat_permissions(TARGET_GROUP_ID, permissions)
         except: pass
-
 
 @dp.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def cmd_start_private(message: Message):
@@ -347,9 +343,9 @@ async def on_startup(bot: Bot):
 
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook()
-    scheduler.shutdown()
-    await bot.session.close()
-    logging.info("🛑 Бот остановлен, сессия закрыта.")
+    if scheduler.running:
+        scheduler.shutdown()
+    logging.info("🛑 Бот остановлен.")
 
 async def health_check(request):
     return web.Response(text="Bot is running OK", status=200)
