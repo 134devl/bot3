@@ -357,11 +357,13 @@ def main():
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
+    app.router.add_get('/', health_check)
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
     )
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+
     setup_application(app, dp, bot=bot)
     
     web.run_app(app, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
