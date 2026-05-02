@@ -69,7 +69,6 @@ WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
 TEXT_PC = (
     "💻 <b>Касательно версии для ПК:</b>\n\n"
-    "Над проектом работают всего два студента. "
     "Разработка десктопной версии требует много времени и ресурсов, "
     "поэтому точную дату релиза назвать пока невозможно."
 )
@@ -353,8 +352,8 @@ async def track_finish(message: Message, state: FSMContext):
     await state.clear()
 
 
-PC_REGEX = re.compile(r"\b(пк|pc|комп|windows|десктоп)\b", re.IGNORECASE)
-IOS_REGEX = re.compile(r"\b(ios|айос|иос|iphone|айфон)\b", re.IGNORECASE)
+PC_REGEX = re.compile(r"\b(пк|pc)\b", re.IGNORECASE)
+IOS_REGEX = re.compile(r"\b(ios|айос)\b", re.IGNORECASE)
 
 @dp.message(F.text, F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def group_message_handler(message: Message):
